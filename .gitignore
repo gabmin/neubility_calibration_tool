@@ -1,0 +1,30 @@
+# --- 민감 정보 / 로컬 설정 ---
+# "ID/PW 기억하기" 체크박스가 켜지면 로봇 IP, bastion ID/PW, Xavier PW, QC PW가
+# 평문 JSON으로 저장되는 파일. 기본적으로 홈 디렉터리(~/.neubie_tool.cfg)에 생기지만
+# 혹시 작업 폴더에 생기더라도 커밋되지 않도록 방어적으로 무시한다.
+.neubie_tool.cfg
+*.neubie_tool.cfg
+
+# 로봇에서 다운로드한 켈리브레이션 bag 데이터 (버튼1 실행 시 ./cali 로 다운로드됨)
+cali/
+*.bag
+*.db3
+
+# Claude Code 로컬 설정 (개인 권한 설정, 공유 불필요)
+.claude/settings.local.json
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# --- PyInstaller 빌드 산출물 ---
+build/
+dist/
+*.spec
+
+# --- OS / 에디터 ---
+.DS_Store
