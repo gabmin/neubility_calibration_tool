@@ -2,9 +2,12 @@
 """뉴빌리티 자율주행 로봇 점검 도구"""
 
 import datetime
+import glob
 import json
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -17,9 +20,19 @@ except ImportError:
     print("pexpect가 설치되어 있지 않습니다. 'pip install pexpect'로 설치하세요.")
     sys.exit(1)
 
+
+def _resource_path(rel_path: str) -> str:
+    """PyInstaller로 빌드된 실행파일에서는 데이터 파일이 sys._MEIPASS 임시 폴더에
+    풀리므로, 그 경로 기준으로 찾는다. python3로 직접 실행할 때는 이 스크립트
+    파일 기준 상대 경로를 쓴다."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel_path)
+
+
 # ──────────────────────────────────────────────────────────────
 # 상수
 # ──────────────────────────────────────────────────────────────
+ICON_PATH = _resource_path("assets/icon.png")
 BASTION_HOST = "bastion.neubie.co.kr"
 XAVIER_USER = "linkxavier"
 BAG_REMOTE_BASE = "/media/link"
@@ -44,6 +57,25 @@ XAVIER_CONTROL_PATH = os.path.join(SSH_CONTROL_DIR, "%r@%h:%p")
 os.makedirs(SSH_CONTROL_DIR, mode=0o700, exist_ok=True)
 
 
+def _cleanup_dead_control_socket(control_path: str):
+    """ControlPersist 소켓 파일은 마스터 프로세스가 비정상 종료(강제 종료, 절전,
+    네트워크 끊김 등)되면 죽은 채로 남을 수 있다. 죽은 소켓이 남아있으면 이후
+    ControlMaster=auto 연결이 응답 없는 소켓을 붙잡고 있다가 밴너 교환 타임아웃/
+    "Connection to UNKNOWN port 65535 timed out" 로 실패하므로, 새 연결을 맺기 전
+    살아있는지 확인하고 죽었으면 지운다."""
+    if not os.path.exists(control_path):
+        return
+    result = subprocess.run(
+        ["ssh", "-O", "check", "-o", f"ControlPath={control_path}", "x"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        try:
+            os.remove(control_path)
+        except OSError:
+            pass
+
+
 def _subprocess_env() -> dict:
     """PyInstaller로 패키징된 실행 파일은 (번들된 라이브러리와 충돌 나는 경우에 한해)
     LD_LIBRARY_PATH를 자기 번들 경로로 덮어쓰고 원래 값을 LD_LIBRARY_PATH_ORIG에
@@ -60,6 +92,44 @@ def _subprocess_env() -> dict:
             env["LD_LIBRARY_PATH"] = orig
         else:
             env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
+_ROS2_ENV_CACHE = None
+
+
+def _ros2_env() -> dict:
+    """ros2/rviz2는 보통 ~/.bashrc의 'source /opt/ros/<distro>/setup.bash'로
+    PATH에 들어온다. 이건 인터랙티브 bash 쉘에서만 실행되므로, 터미널에서 실행할 땐
+    보이지만 앱 메뉴/.desktop 아이콘으로 실행하면 이 앱은 그 쉘을 거치지 않아
+    PATH에 ros2/rviz2가 없어 'No such file or directory' 에러가 난다. 이미 PATH에
+    있으면 그대로 쓰고, 없으면 /opt/ros/*/setup.bash를 찾아 직접 source한 환경을
+    병합해서 리턴한다."""
+    global _ROS2_ENV_CACHE
+    if _ROS2_ENV_CACHE is not None:
+        return _ROS2_ENV_CACHE
+    env = _subprocess_env()
+    if shutil.which("ros2", path=env.get("PATH")) and shutil.which("rviz2", path=env.get("PATH")):
+        _ROS2_ENV_CACHE = env
+        return env
+    for setup_script in sorted(glob.glob("/opt/ros/*/setup.bash"), reverse=True):
+        try:
+            result = subprocess.run(
+                ["bash", "-c", f"source {shlex.quote(setup_script)} && env -0"],
+                capture_output=True, timeout=10,
+            )
+        except Exception:
+            continue
+        if result.returncode != 0:
+            continue
+        merged = dict(env)
+        for line in result.stdout.split(b"\x00"):
+            if b"=" in line:
+                k, _, v = line.partition(b"=")
+                merged[k.decode(errors="replace")] = v.decode(errors="replace")
+        _ROS2_ENV_CACHE = merged
+        return merged
+    _ROS2_ENV_CACHE = env
     return env
 
 
@@ -146,6 +216,11 @@ class AuthError(Exception):
     pass
 
 
+class Cancelled(Exception):
+    """사용자가 중지 버튼으로 실행 중인 원격 명령을 취소했을 때."""
+    pass
+
+
 # ──────────────────────────────────────────────────────────────
 # SSHRunner
 # ──────────────────────────────────────────────────────────────
@@ -157,6 +232,23 @@ class SSHRunner:
         self.xavier_pw = xavier_pw
         self.qc_pw = qc_pw or xavier_pw  # 로봇에 따라 pi 비번이 다를 수 있음 — 안 주어지면 Xavier 비번 재사용
         self.log = log_fn
+        _cleanup_dead_control_socket(BASTION_CONTROL_PATH.replace("%r", bastion_user))
+        _cleanup_dead_control_socket(
+            XAVIER_CONTROL_PATH.replace("%r", XAVIER_USER).replace("%h", robot_ip).replace("%p", "22")
+        )
+        self._current_child = None
+        self._cancel_requested = False
+
+    def cancel(self):
+        """실행 중인 원격 명령(예: QC 점검)을 강제로 중지한다. 다른 스레드에서
+        blocking 중인 child.expect()를 깨우기 위해 프로세스를 강제 종료한다."""
+        self._cancel_requested = True
+        child = self._current_child
+        if child is not None:
+            try:
+                child.close(force=True)
+            except Exception:
+                pass
 
     def _ssh_cmd(self, tty: bool = False, x11: bool = False):
         flags = ""
@@ -201,46 +293,60 @@ class SSHRunner:
         full_cmd = f'{self._ssh_cmd(tty=tty, x11=x11)} "{cmd}"'
         short = cmd if len(cmd) <= 80 else cmd[:80] + "..."
         _log(f"[실행] {short}")
+        self._cancel_requested = False
         child = pexpect.spawn("/bin/bash", ["-c", full_cmd], encoding=None, timeout=timeout,
                                env=_subprocess_env())
-        output_buf = []
-        sent = {"bastion": 0, "xavier": 0}
-        while True:
-            try:
-                idx = child.expect(
-                    PASSWORD_PATTERNS + [b"\n", pexpect.EOF, pexpect.TIMEOUT],
-                    timeout=timeout,
-                )
-            except pexpect.exceptions.TIMEOUT:
-                _log("[오류] 타임아웃")
-                child.close(force=True)
-                raise TimeoutError("타임아웃")
-            chunk = child.before.decode(errors="replace") if child.before else ""
-            if chunk:
-                output_buf.append(chunk)
-                for line in chunk.splitlines():
-                    segs = _trim_segments(ansi_segments(line))
-                    if segs:
-                        _log(segs)
-            if idx < len(PASSWORD_PATTERNS):
-                self._send_password(child, idx, chunk, sent)
-            elif idx == len(PASSWORD_PATTERNS):  # \n
-                after = child.after.decode(errors="replace") if isinstance(child.after, bytes) else ""
-                after = strip_ansi(after).strip()
-                if after:
-                    _log(after)
-            elif idx == len(PASSWORD_PATTERNS) + 1:  # EOF
-                break
-            else:
-                _log("[오류] SSH 명령 타임아웃")
-                child.close(force=True)
-                raise TimeoutError("SSH 명령이 타임아웃되었습니다.")
-        child.close()
-        rc = child.exitstatus if child.exitstatus is not None else child.signalstatus
-        if rc is not None and rc != 0:
-            joined = "".join(output_buf).strip()
-            raise RuntimeError(f"SSH 명령 실패 (종료코드 {rc}){': ' + joined if joined else ''}")
-        return "".join(output_buf).strip()
+        self._current_child = child
+        try:
+            output_buf = []
+            sent = {"bastion": 0, "xavier": 0}
+            while True:
+                try:
+                    idx = child.expect(
+                        PASSWORD_PATTERNS + [b"\n", pexpect.EOF, pexpect.TIMEOUT],
+                        timeout=timeout,
+                    )
+                except pexpect.exceptions.TIMEOUT:
+                    if self._cancel_requested:
+                        break
+                    _log("[오류] 타임아웃")
+                    child.close(force=True)
+                    raise TimeoutError("타임아웃")
+                except pexpect.exceptions.EOF:
+                    # 중지 버튼으로 강제 종료된 경우 등, 패턴 매칭 전에 프로세스가 죽은 경우
+                    break
+                chunk = child.before.decode(errors="replace") if child.before else ""
+                if chunk:
+                    output_buf.append(chunk)
+                    for line in chunk.splitlines():
+                        segs = _trim_segments(ansi_segments(line))
+                        if segs:
+                            _log(segs)
+                if idx < len(PASSWORD_PATTERNS):
+                    self._send_password(child, idx, chunk, sent)
+                elif idx == len(PASSWORD_PATTERNS):  # \n
+                    after = child.after.decode(errors="replace") if isinstance(child.after, bytes) else ""
+                    after = strip_ansi(after).strip()
+                    if after:
+                        _log(after)
+                elif idx == len(PASSWORD_PATTERNS) + 1:  # EOF
+                    break
+                else:
+                    if self._cancel_requested:
+                        break
+                    _log("[오류] SSH 명령 타임아웃")
+                    child.close(force=True)
+                    raise TimeoutError("SSH 명령이 타임아웃되었습니다.")
+            child.close(force=True)
+            if self._cancel_requested:
+                raise Cancelled("사용자 요청으로 중지되었습니다.")
+            rc = child.exitstatus if child.exitstatus is not None else child.signalstatus
+            if rc is not None and rc != 0:
+                joined = "".join(output_buf).strip()
+                raise RuntimeError(f"SSH 명령 실패 (종료코드 {rc}){': ' + joined if joined else ''}")
+            return "".join(output_buf).strip()
+        finally:
+            self._current_child = None
 
     def run_scp_download(self, remote_path: str, local_dest: str):
         cmd = (
@@ -443,7 +549,7 @@ def do_bag_play(log):
     log("=== bag 재생 시작 ===")
     bag_proc = subprocess.Popen(
         ["ros2", "bag", "play", local_path, "--loop"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_subprocess_env(),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_ros2_env(),
     )
     log(f"ros2 bag play PID: {bag_proc.pid} (반복 재생, 창을 직접 닫아 종료하세요)")
     log("bag 재생 시작 완료 ✓", color="green")
@@ -453,7 +559,7 @@ def do_rviz_only(log):
     log("=== rviz2 실행 ===")
     rviz_cmd = ["rviz2", "-d", RVIZ_CONFIG] if RVIZ_CONFIG and os.path.exists(RVIZ_CONFIG) else ["rviz2"]
     rviz_proc = subprocess.Popen(
-        rviz_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_subprocess_env(),
+        rviz_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_ros2_env(),
     )
     log(f"rviz2 PID: {rviz_proc.pid}")
     log("rviz2 실행 완료 ✓ (창을 직접 닫아 종료하세요)", color="green")
@@ -471,9 +577,12 @@ def do_qc(runner: SSHRunner, log):
 # ──────────────────────────────────────────────────────────────
 class App(tk.Tk):
     def __init__(self):
-        super().__init__()
+        # className → WM_CLASS. 기본값(Tk)로 두면 창 전환기/독 등에서 앱 이름이
+        # "Tk"로 표시되고, .desktop 런처(StartupWMClass)와도 매칭이 안 된다.
+        super().__init__(className="neubie_tool")
         self.title("뉴빌리티 로봇 점검 도구")
         self.resizable(True, True)
+        self._set_icon()
         self._xterm_proc = None
         self._xavier_connected = False
         self._conn_gated_buttons = []
@@ -483,6 +592,14 @@ class App(tk.Tk):
         self._load_config()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._open_xterm()  # 로컬 터미널은 항상 열려있는 상태로 유지
+
+    def _set_icon(self):
+        """창/태스크바 아이콘. 실패해도(아이콘 파일 없음 등) 앱은 계속 떠야 하므로 무시."""
+        try:
+            self._icon_img = tk.PhotoImage(file=ICON_PATH)  # GC 방지용으로 참조 유지
+            self.iconphoto(True, self._icon_img)  # True → 이후 열리는 Toplevel(QC 창 등)에도 적용
+        except Exception as e:
+            print(f"[경고] 아이콘 로드 실패: {e}", file=sys.stderr)
 
     # ── UI 구성 ──────────────────────────────────────────────
     def _build_ui(self):
@@ -780,6 +897,8 @@ class App(tk.Tk):
                 fn(*args)
                 if on_success:
                     self.after(0, on_success)
+            except Cancelled as exc:
+                self.log(f"[중지됨] {exc}", color="yellow")
             except AuthError as e:
                 self.log(f"[인증 오류] {e}", color="red")
                 self.after(0, self._set_xavier_status, False)
@@ -946,7 +1065,7 @@ class App(tk.Tk):
     def _on_rviz_only(self):
         self._run_in_thread(do_rviz_only, self.log)
 
-    def _open_qc_window(self):
+    def _open_qc_window(self, runner):
         win = tk.Toplevel(self)
         win.title("QC 점검 결과")
         win.geometry("900x580")
@@ -966,9 +1085,20 @@ class App(tk.Tk):
         txt.tag_config("white",   foreground="#d4d4d4")
         txt.tag_config("black",   foreground="#808080")
 
-        close_btn = tk.Button(win, text="닫기", state=tk.DISABLED,
+        btn_frame = tk.Frame(win, bg="#1e1e1e")
+        btn_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
+
+        def _do_stop():
+            stop_btn.config(state=tk.DISABLED, text="중지 중...")
+            runner.cancel()
+
+        stop_btn = tk.Button(btn_frame, text="중지", command=_do_stop, pady=6,
+                             bg="#f44747", fg="white")
+        stop_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+
+        close_btn = tk.Button(btn_frame, text="닫기", state=tk.DISABLED,
                               command=win.destroy, pady=6)
-        close_btn.pack(fill=tk.X, padx=8, pady=(0, 8))
+        close_btn.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
 
         def log_fn(msg, color=None, overwrite=False):
             def _append():
@@ -984,6 +1114,7 @@ class App(tk.Tk):
             win.after(0, _append)
 
         def done_fn():
+            stop_btn.config(state=tk.DISABLED)
             close_btn.config(state=tk.NORMAL)
             txt.config(state=tk.NORMAL)
             txt.insert(tk.END, "\n--- 완료. 스크린샷 후 닫기 버튼을 누르세요. ---\n", "green")
@@ -996,7 +1127,7 @@ class App(tk.Tk):
         runner = self._make_runner()
         if not runner:
             return
-        qc_log, done_fn = self._open_qc_window()
+        qc_log, done_fn = self._open_qc_window(runner)
         self.log("QC 점검이 별도 창에서 실행 중입니다.", color="green")
         self._run_in_thread(do_qc, runner, qc_log, on_done=done_fn)
 

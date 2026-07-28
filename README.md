@@ -19,27 +19,50 @@
 - `xterm`, `xdotool`, `python3-tk`
 - 로컬에 `ssh`, `scp`, `ros2`, `rviz2` 설치되어 있어야 함
 
-## 설치
+## 설치 및 실행 — 두 가지 방법 중 편한 것으로
+
+### 트랙 A — 소스로 실행 (Python 환경 그대로 쓰고 싶은 분)
 
 ```bash
-./setup.sh
-```
-
-필요한 패키지(xterm, xdotool, python3-tk, pexpect)를 확인하고 없으면 설치합니다.
-
-## 실행
-
-```bash
+git clone git@github.com:gabmin/neubility_calibration_tool.git
+cd neubility_calibration_tool
+./setup.sh          # 필요한 패키지(xterm, xdotool, python3-tk, pexpect) 확인 후 설치
 python3 neubie_tool.py
 ```
 
-### 단일 실행 파일로 빌드 (배포용)
+### 트랙 B — 실행파일 다운로드 (Python 설치 없이 바로 실행하고 싶은 분)
+
+Python이나 다른 설치 과정 없이 파일만 받아서 바로 실행할 수 있습니다.
+
+> ⚠️ **`neubie_tool` 바이너리 파일 하나만 받으면 파일 관리자에서 더블클릭 실행이 안 됩니다** ("There is no application installed for 'executable' files" 오류). Linux ELF 실행파일은 Windows `.exe`와 달리 파일 관리자가 기본적으로 실행할 방법을 모르기 때문입니다. 그래서 배포는 꼭 아래 **묶음 파일(`neubie_tool_bundle.tar.gz`)**로 받아야 합니다.
+
+받는 쪽이 할 일:
+
+```bash
+tar xzf neubie_tool_bundle.tar.gz
+./install_desktop_launcher.sh
+```
+
+`install_desktop_launcher.sh`가 실행파일과 같은 폴더에 `neubie_tool.desktop` 런처를 만들어줍니다. **이후로는 `neubie_tool`이 아니라 이 `neubie_tool.desktop` 파일을 더블클릭**하세요 — 커스텀 아이콘과 함께 보이고, 클릭하면 GUI가 바로 뜹니다 (파일 관리자가 "신뢰할 수 없는 실행 파일" 경고를 띄우면 한 번만 허용/실행을 눌러주면 됨). 앱 메뉴(`~/.local/share/applications/`)에도 등록되어 "뉴빌리티 로봇 점검 도구"로 검색해서 실행할 수도 있습니다.
+
+터미널 실행만 필요하다면 `tar` 안의 `neubie_tool`을 바로 써도 됩니다:
+
+```bash
+chmod +x neubie_tool
+./neubie_tool
+```
+
+Python/pexpect/tkinter 설치가 필요 없습니다. 단, `xterm`/`xdotool`/`ssh`/`ros2`/`rviz2`는 두 트랙 공통으로 각자 컴퓨터에 설치되어 있어야 합니다.
+
+### 메인테이너용 — 실행파일 빌드 및 배포
 
 ```bash
 ./build.sh
 ```
 
-`dist/neubie_tool` 하나만 공유하면 팀원 컴퓨터에 Python/pexpect/tkinter 설치 없이 실행할 수 있습니다. 단, xterm/xdotool/ssh/ros2/rviz2는 각자 컴퓨터에 설치되어 있어야 합니다.
+`dist/neubie_tool`(단일 실행파일)과 `dist/neubie_tool_bundle.tar.gz`(실행파일+아이콘+런처 설치 스크립트 묶음)가 만들어집니다. **팀원에게는 `neubie_tool` 하나만 주지 말고 `neubie_tool_bundle.tar.gz`를 전달하세요** (Slack, 공유 드라이브 등 편한 방법으로). 버전을 태그로 관리하며 GitHub에서 다운받게 하고 싶다면, 저장소 **Releases** 탭에서 새 릴리즈를 만들고 이 tar.gz를 Assets로 첨부하는 방법도 있습니다 (선택 사항).
+
+빌드 산출물(`build/`, `dist/`)은 `.gitignore`로 저장소 커밋 대상에서는 제외되어 있습니다.
 
 ## GUI 입력값
 
