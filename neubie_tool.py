@@ -146,13 +146,15 @@ def _ssh_proxy_opts(bastion_user: str) -> str:
         f'-o ProxyCommand="{proxy_cmd}"'
     )
 
-# PASSWORD_PATTERNS[2] = sudo, [3] = qc 내부 pi 접속 ("Enter password of linkxavier :")
+# PASSWORD_PATTERNS[2] = sudo, [3] = qc 내부 계정 접속 ("Enter password of linkxavier :",
+# "Enter password of pi1 :" 등 — linkxavier/pi1/pi2/pi3 전부 동일한 문구를 쓴다).
+# 대상 계정명을 캡처해서, linkxavier면 Xavier 비번을, pi1/2/3이면 QC 비번을 보낸다
+# (전에는 대상을 안 가리고 전부 QC 비번을 보내는 버그가 있었음).
 PASSWORD_PATTERNS = [
     r"[Pp]assword\s*:",
     r"[Pp]assword for",
-    r"\[sudo\] password",   # index 2 — sudo 전용, 항상 Xavier 비번
-    r"[Pp]assword\s+of\s",  # index 3 — qc 내부 pi1/2/3 접속 (여러 번 반복 가능), QC 비번
-    # 로봇에 따라 pi 계정 비번이 Xavier 비번과 다를 수 있어 별도 필드로 분리
+    r"\[sudo\] password",              # index 2 — sudo 전용, 항상 Xavier 비번
+    r"[Pp]assword\s+of\s+(\S+)\s*:",   # index 3 — 캡처그룹(1) = 대상 계정명(linkxavier/pi1/pi2/pi3)
 ]
 
 # ANSI 이스케이프 제거 (터미널 출력 → ScrolledText 표시용)
@@ -261,14 +263,21 @@ class SSHRunner:
     def _send_password(self, child, idx: int, before_chunk: str, sent: dict):
         """
         idx 2 = sudo → 항상 Xavier 비번.
-        idx 3 = qc 내부 pi 접속 ("password of ...") → QC 비번(로봇에 따라 Xavier와 다를 수 있음), 횟수 제한 없음.
+        idx 3 = qc 내부 계정 접속 ("password of linkxavier/pi1/pi2/pi3 :") → 캡처된 대상
+                계정명이 linkxavier면 Xavier 비번, pi1/2/3이면 QC 비번(로봇에 따라 Xavier와
+                다를 수 있음). linkxavier도 pi1/2/3과 동일한 문구를 쓰므로 대상을 안 가리면
+                전부 QC 비번으로 잘못 나간다 — 반드시 캡처그룹으로 구분해야 한다.
         idx 0/1 = before_chunk 로 bastion vs xavier 구분, 두 번째 시도부터 AuthError.
         """
         if idx == 2:
             child.sendline(self.xavier_pw)
             return
         if idx == 3:
-            child.sendline(self.qc_pw)
+            target = child.match.group(1).decode(errors="replace") if child.match and child.match.lastindex else ""
+            if target == XAVIER_USER:
+                child.sendline(self.xavier_pw)
+            else:
+                child.sendline(self.qc_pw)
             return
         lower = before_chunk.lower()
         is_bastion = "bastion" in lower or self.bastion_user.lower() in lower
@@ -551,8 +560,20 @@ def do_bag_play(log):
         ["ros2", "bag", "play", local_path, "--loop"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=_ros2_env(),
     )
-    log(f"ros2 bag play PID: {bag_proc.pid} (반복 재생, 창을 직접 닫아 종료하세요)")
+    log(f"ros2 bag play PID: {bag_proc.pid} (반복 재생, 'bag 종료' 버튼으로 멈출 수 있습니다)")
     log("bag 재생 시작 완료 ✓", color="green")
+    return bag_proc
+
+
+def do_bag_stop(bag_proc, log):
+    log("=== bag 재생 중지 ===")
+    bag_proc.terminate()
+    try:
+        bag_proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        bag_proc.kill()
+        bag_proc.wait(timeout=5)
+    log("bag 재생 중지 완료 ✓", color="green")
 
 
 def do_rviz_only(log):
@@ -586,6 +607,8 @@ class App(tk.Tk):
         self._xterm_proc = None
         self._xavier_connected = False
         self._conn_gated_buttons = []
+        self._named_buttons = {}
+        self._bag_proc = None
         self._busy = False
         self._build_ui()
         self._set_buttons(True)  # 시작 시 Xavier 접속 필요 버튼 잠금
@@ -705,7 +728,7 @@ class App(tk.Tk):
         work_items = [
             ("녹화", self._on_record, None, True),
             ("다운로드", self._on_download, None, True),
-            ("bag 실행", self._on_bag_play, None, False),
+            ("bag 실행", self._on_bag_play, None, False, "bag_play"),
             ("rviz 실행", self._on_rviz_only, None, False),
             ("QC 점검", self._on_qc, None, True),
         ]
@@ -764,6 +787,7 @@ class App(tk.Tk):
             text, cmd = item[0], item[1]
             indicator = item[2] if len(item) > 2 else None
             requires_conn = item[3] if len(item) > 3 else False
+            name = item[4] if len(item) > 4 else None
             row, col = divmod(idx, columns)
             b = tk.Button(parent, text=text, command=cmd, pady=8, compound=tk.LEFT)
             b.grid(row=row, column=col, sticky="ew", padx=3, pady=3)
@@ -774,6 +798,8 @@ class App(tk.Tk):
                 self._xavier_status_btn = b
             if requires_conn:
                 self._conn_gated_buttons.append(b)
+            if name:
+                self._named_buttons[name] = b
             buttons.append(b)
         for c in range(columns):
             parent.columnconfigure(c, weight=1, uniform="btn_col")
@@ -894,9 +920,9 @@ class App(tk.Tk):
 
         def _worker():
             try:
-                fn(*args)
+                result = fn(*args)
                 if on_success:
-                    self.after(0, on_success)
+                    self.after(0, on_success, result)
             except Cancelled as exc:
                 self.log(f"[중지됨] {exc}", color="yellow")
             except AuthError as e:
@@ -1018,7 +1044,7 @@ class App(tk.Tk):
                 self._save_config()
             self._run_in_thread(
                 do_xavier_connect, runner, self.log,
-                on_success=lambda: self._set_xavier_status(True),
+                on_success=lambda _r=None: self._set_xavier_status(True),
             )
 
     def _on_logger_stop(self):
@@ -1046,7 +1072,7 @@ class App(tk.Tk):
         if runner:
             self._run_in_thread(
                 do_xavier_disconnect, runner, self.log,
-                on_success=lambda: self._set_xavier_status(False),
+                on_success=lambda _r=None: self._set_xavier_status(False),
             )
 
     def _on_record(self):
@@ -1060,7 +1086,18 @@ class App(tk.Tk):
             self._run_in_thread(do_download, runner, self.log)
 
     def _on_bag_play(self):
-        self._run_in_thread(do_bag_play, self.log)
+        if self._bag_proc is not None and self._bag_proc.poll() is None:
+            self._run_in_thread(do_bag_stop, self._bag_proc, self.log, on_done=self._on_bag_stopped)
+            return
+        self._run_in_thread(do_bag_play, self.log, on_success=self._on_bag_started)
+
+    def _on_bag_started(self, bag_proc):
+        self._bag_proc = bag_proc
+        self._named_buttons["bag_play"].config(text="bag 종료")
+
+    def _on_bag_stopped(self):
+        self._bag_proc = None
+        self._named_buttons["bag_play"].config(text="bag 실행")
 
     def _on_rviz_only(self):
         self._run_in_thread(do_rviz_only, self.log)
