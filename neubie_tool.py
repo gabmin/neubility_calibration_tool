@@ -555,6 +555,14 @@ def do_bag_play(log):
         raise FileNotFoundError(
             f"bag 폴더가 없습니다: {local_path}\n먼저 다운로드하세요."
         )
+    # 이전 실행(비정상 종료 등)에서 '종료' 버튼을 못 눌러 남은 --loop 재생 프로세스가
+    # 있으면, 새 bag과 같은 토픽으로 동시에 발행되어 rviz에 두 토픽이 뒤섞여
+    # 번갈아 보이는 문제가 생긴다. 새로 재생을 시작하기 전에 그런 잔여 프로세스를 정리.
+    killed = subprocess.run(
+        ["pkill", "-f", "ros2 bag play"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    if killed.returncode == 0:
+        log("[경고] 이전에 남아있던 bag 재생 프로세스를 발견해 정리했습니다.", color="yellow")
     log("=== bag 재생 시작 ===")
     bag_proc = subprocess.Popen(
         ["ros2", "bag", "play", local_path, "--loop"],
@@ -1009,6 +1017,17 @@ class App(tk.Tk):
 
     def _cleanup_on_exit(self):
         self._close_xterm()
+
+        # --loop로 도는 bag 재생을 안 끄고 창을 닫으면 프로세스가 백그라운드에
+        # 그대로 남아 계속 발행된다. 다음 실행에서 새 bag을 재생하면 이 잔여
+        # 프로세스와 같은 토픽에 동시에 발행되어 rviz에 두 토픽이 번갈아 보이는
+        # 문제가 생기므로, 종료 시 반드시 먼저 정리한다.
+        if self._bag_proc is not None and self._bag_proc.poll() is None:
+            try:
+                do_bag_stop(self._bag_proc, self.log)
+            except Exception as exc:
+                self.log(f"[종료 정리] bag 재생 종료 실패: {exc}", color="red")
+            self._bag_proc = None
 
         ip = self._entries["로봇 IP"].get().strip()
         bpw = self._entries["bastion PW"].get()
