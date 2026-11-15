@@ -76,6 +76,33 @@ def _cleanup_dead_control_socket(control_path: str):
             pass
 
 
+_STALE_MUX_RE = re.compile(r"banner exchange|port 65535|mux_client", re.I)
+
+
+def _is_stale_mux_error(text: str) -> bool:
+    return bool(_STALE_MUX_RE.search(text or ""))
+
+
+def _reset_control_masters(bastion_user: str, robot_ip: str):
+    """살아있는 척하지만 실제로는 먹통인(절전/네트워크 전환 후) ControlPersist 마스터를
+    강제로 종료하고 소켓 파일을 지운다. 다음 연결이 새 마스터로 깨끗하게 맺어진다."""
+    for control_path in (
+        BASTION_CONTROL_PATH.replace("%r", bastion_user),
+        XAVIER_CONTROL_PATH.replace("%r", XAVIER_USER).replace("%h", robot_ip).replace("%p", "22"),
+    ):
+        try:
+            subprocess.run(
+                ["ssh", "-O", "exit", "-o", f"ControlPath={control_path}", "x"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+            )
+        except Exception:
+            pass
+        try:
+            os.remove(control_path)
+        except OSError:
+            pass
+
+
 def _subprocess_env() -> dict:
     """PyInstaller로 패키징된 실행 파일은 (번들된 라이브러리와 충돌 나는 경우에 한해)
     LD_LIBRARY_PATH를 자기 번들 경로로 덮어쓰고 원래 값을 LD_LIBRARY_PATH_ORIG에
@@ -137,11 +164,13 @@ def _ssh_proxy_opts(bastion_user: str) -> str:
     """ssh/scp 공통으로 쓰는 옵션 — bastion 홉을 ProxyCommand로 직접 멀티플렉싱."""
     proxy_cmd = (
         f"ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 "
+        f"-o ServerAliveInterval=5 -o ServerAliveCountMax=3 "
         f"-o ControlMaster=auto -o ControlPersist=600 -o ControlPath={BASTION_CONTROL_PATH} "
         f"{bastion_user}@{BASTION_HOST} -W %h:%p"
     )
     return (
         f'-o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 '
+        f'-o ServerAliveInterval=5 -o ServerAliveCountMax=3 '
         f'-o ControlMaster=auto -o ControlPersist=600 -o ControlPath={XAVIER_CONTROL_PATH} '
         f'-o ProxyCommand="{proxy_cmd}"'
     )
@@ -297,8 +326,19 @@ class SSHRunner:
     def run_remote_interactive(self, cmd, timeout=SSH_TIMEOUT, tty: bool = False,
                                x11: bool = False, log_fn=None):
         """단일 SSH 연결로 cmd 를 실행 (필요한 명령은 &&/;로 묶어서 한 번에 전달할 것).
-        log_fn 을 지정하면 그 함수로 출력, 아니면 self.log 사용."""
+        log_fn 을 지정하면 그 함수로 출력, 아니면 self.log 사용.
+        연결 단계에서 먹통 마스터 때문에 실패하면(명령은 아직 실행 전) 마스터를 리셋하고 1회 재시도."""
         _log = log_fn if log_fn is not None else self.log
+        try:
+            return self._run_remote_once(cmd, timeout, tty, x11, _log)
+        except RuntimeError as exc:
+            if not _is_stale_mux_error(str(exc)):
+                raise
+            _log("[재시도] SSH 연결 캐시가 끊겨 있어 초기화 후 다시 시도합니다...")
+            _reset_control_masters(self.bastion_user, self.robot_ip)
+            return self._run_remote_once(cmd, timeout, tty, x11, _log)
+
+    def _run_remote_once(self, cmd, timeout, tty, x11, _log):
         full_cmd = f'{self._ssh_cmd(tty=tty, x11=x11)} "{cmd}"'
         short = cmd if len(cmd) <= 80 else cmd[:80] + "..."
         _log(f"[실행] {short}")
@@ -358,6 +398,16 @@ class SSHRunner:
             self._current_child = None
 
     def run_scp_download(self, remote_path: str, local_dest: str):
+        try:
+            self._run_scp_once(remote_path, local_dest)
+        except RuntimeError as exc:
+            if not _is_stale_mux_error(str(exc)):
+                raise
+            self.log("[재시도] SSH 연결 캐시가 끊겨 있어 초기화 후 다시 시도합니다...")
+            _reset_control_masters(self.bastion_user, self.robot_ip)
+            self._run_scp_once(remote_path, local_dest)
+
+    def _run_scp_once(self, remote_path: str, local_dest: str):
         cmd = (
             f"scp -r {_ssh_proxy_opts(self.bastion_user)} "
             f"{XAVIER_USER}@{self.robot_ip}:{remote_path} {local_dest}/"
@@ -366,6 +416,7 @@ class SSHRunner:
         child = pexpect.spawn("/bin/bash", ["-c", cmd], encoding=None, timeout=SCP_TIMEOUT,
                                env=_subprocess_env())
         sent = {"bastion": 0, "xavier": 0}
+        scp_out = []
         while True:
             try:
                 idx = child.expect(
@@ -376,6 +427,7 @@ class SSHRunner:
                 child.close(force=True)
                 raise TimeoutError("SCP 타임아웃")
             chunk = child.before.decode(errors="replace") if child.before else ""
+            scp_out.append(chunk)
             if idx < len(PASSWORD_PATTERNS):
                 self._send_password(child, idx, chunk, sent)
             elif idx == len(PASSWORD_PATTERNS):
@@ -386,9 +438,11 @@ class SSHRunner:
             else:
                 child.close(force=True)
                 raise TimeoutError("SCP 타임아웃")
-        rc = child.exitstatus if child.exitstatus is not None else 0
+        child.close()
+        rc = child.exitstatus if child.exitstatus is not None else (child.signalstatus or 0)
         if rc != 0:
-            raise RuntimeError(f"SCP 실패 (종료코드 {rc})")
+            detail = strip_ansi("".join(scp_out)).strip()
+            raise RuntimeError(f"SCP 실패 (종료코드 {rc}){': ' + detail if detail else ''}")
         self.log("[SCP] 다운로드 완료 ✓", color="green")
 
 
